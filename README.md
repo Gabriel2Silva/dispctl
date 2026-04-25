@@ -35,8 +35,8 @@ you full control over every relevant setting.
 
 ## Dependencies
 
-- [`gdctl`](https://gitlab.gnome.org/jadahl/gdctl) — GNOME Display Controller
-- `zenity` — GTK dialog toolkit
+- [`gdctl`](https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/4190) — GNOME Display Controller
+- [`zenity`](https://gitlab.gnome.org/GNOME/zenity) — GTK dialog toolkit
 - GNOME Shell with Mutter (requires `org.gnome.Mutter.DisplayConfig` D-Bus API)
 
 ## Usage
