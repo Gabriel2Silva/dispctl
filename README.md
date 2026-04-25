@@ -1,4 +1,4 @@
-# dispctl
+# dispctl ![GitHub top language](https://img.shields.io/github/languages/top/Gabriel2Silva/dispctl?logo=gnubash&color=%234EAA25)
 
 A display configuration script for GNOME on Wayland, designed as a proper
 replacement for the `Super+P` shortcut.
