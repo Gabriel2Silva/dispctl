@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+
+set -u
+
+TITLE="Display Configuration"
+
+cancel() {
+  exit 0
+}
+
+show_error() {
+  local message=$1
+
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --error --title="$TITLE" --text="$message" >/dev/null 2>&1 || true
+  fi
+
+  printf '%s\n' "$message" >&2
+}
+
+require_command() {
+  local cmd=$1
+
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    show_error "Required command not found: $cmd"
+    exit 1
+  fi
+}
+
+run_config() {
+  local status err_file
+
+  err_file=$(mktemp)
+  if "$@" >/dev/null 2>"$err_file"; then
+    rm -f "$err_file"
+    return 0
+  fi
+
+  status=$?
+  show_error "$(cat "$err_file")"
+  rm -f "$err_file"
+  return "$status"
+}
+
+run_capture() {
+  declare -n result_ref=$1
+  shift
+
+  local status err_file
+
+  err_file=$(mktemp)
+  if result_ref=$("$@" 2>"$err_file"); then
+    rm -f "$err_file"
+    return 0
+  fi
+
+  status=$?
+  show_error "$(cat "$err_file")"
+  rm -f "$err_file"
+  return "$status"
+}
+
+run_zenity() {
+  local output
+
+  if output=$("$@" 2>/dev/null); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  return 1
+}
+
+zenity_pick_one() {
+  local prompt=$1
+  local column=$2
+  local cancel_label=$3
+  shift 3
+
+  run_zenity zenity --list \
+    --title="$TITLE" \
+    --text="$prompt" \
+    --cancel-label="$cancel_label" \
+    --column="$column" \
+    --column="Value" \
+    --hide-column=2 \
+    --print-column=2 \
+    "$@"
+}
+
+declare -a MONITORS=()
+declare -A MONITOR_LABEL=()
+declare -A RESOLUTIONS=()
+declare -A MODES=()
+declare -A MODE_SEEN=()
+declare -a SELECTED_MONITORS=()
+
+parse_query() {
+  local query=$1
+  local current_connector=""
+  local line connector resolution mode_key mode_token vrr_suffix
+
+  while IFS= read -r line; do
+    [[ $line == 'Logical monitors:'* ]] && break
+
+    if [[ $line =~ [├└]──Monitor[[:space:]]([^[:space:]]+) ]]; then
+      connector=${BASH_REMATCH[1]}
+      current_connector=$connector
+      if [[ -z ${MONITOR_LABEL["$current_connector"]+x} ]]; then
+        MONITORS+=("$current_connector")
+        MONITOR_LABEL["$current_connector"]=$current_connector
+      fi
+      continue
+    fi
+
+    [[ -z $current_connector ]] && continue
+
+    if [[ $line =~ display-name[[:space:]]+⇒[[:space:]]+(.+)$ ]]; then
+      MONITOR_LABEL["$current_connector"]=${BASH_REMATCH[1]}
+      continue
+    fi
+
+    if [[ $line =~ [├└]──([0-9]+x[0-9]+)@([0-9.]+)(\+vrr)?$ ]]; then
+      resolution=${BASH_REMATCH[1]}
+      vrr_suffix=${BASH_REMATCH[3]}
+      mode_token="${resolution}@${BASH_REMATCH[2]}${vrr_suffix}"
+      mode_key="${current_connector}|${mode_token}"
+
+      [[ -n ${MODE_SEEN["$mode_key"]+x} ]] && continue
+      MODE_SEEN["$mode_key"]=1
+
+      if [[ ${RESOLUTIONS["$current_connector"]-} != *"|${resolution}|"* ]]; then
+        RESOLUTIONS["$current_connector"]+="|${resolution}|"
+      fi
+
+      MODES["${current_connector}|${resolution}"]+="${mode_token}"$'\n'
+    fi
+  done <<< "$query"
+}
+
+build_monitor_rows() {
+  local rows=()
+  local connector label
+
+  for connector in "${MONITORS[@]}"; do
+    label=${MONITOR_LABEL["$connector"]}
+    rows+=("$label" "$connector")
+  done
+
+  printf '%s\n' "${rows[@]}"
+}
+
+build_resolution_rows() {
+  local connector=$1
+  local rows=()
+  local value
+
+  IFS='|' read -r -a values <<< "${RESOLUTIONS["$connector"]-}"
+
+  for value in "${values[@]}"; do
+    [[ -z $value ]] && continue
+    rows+=("$value" "$value")
+  done
+
+  printf '%s\n' "${rows[@]}"
+}
+
+build_mode_rows() {
+  local connector=$1
+  local resolution=$2
+  local rows=()
+  local line refresh label
+
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    refresh=${line#*@}
+    refresh=${refresh%+vrr}
+    label="${refresh} Hz"
+
+    if [[ $line == *"+vrr" ]]; then
+      label+=" (VRR)"
+    fi
+
+    rows+=("$label" "$line")
+  done <<< "${MODES["${connector}|${resolution}"]-}"
+
+  printf '%s\n' "${rows[@]}"
+}
+
+pick_mode_for_connector() {
+  local connector=$1
+  local prompt_prefix=$2
+  local resolution mode label choice
+  local -a resolution_rows
+  local -a mode_rows
+  local resolution_prompt refresh_prompt
+
+  label=${MONITOR_LABEL["$connector"]}
+  resolution_prompt="Choose a resolution for ${label}."
+  refresh_prompt="Choose a refresh rate for ${label} at "
+
+  if [[ -n $prompt_prefix ]]; then
+    resolution_prompt="${prompt_prefix} ${resolution_prompt}"
+  fi
+
+  while :; do
+    mapfile -t resolution_rows < <(build_resolution_rows "$connector")
+    [[ ${#resolution_rows[@]} -eq 0 ]] && cancel
+    resolution_rows+=("Back" "__back__")
+
+    choice=$(zenity_pick_one "$resolution_prompt" "Resolution" "Back" "${resolution_rows[@]}") || return 1
+    [[ $choice == "__back__" ]] && return 1
+    resolution=$choice
+
+    while :; do
+      mapfile -t mode_rows < <(build_mode_rows "$connector" "$resolution")
+      [[ ${#mode_rows[@]} -eq 0 ]] && cancel
+      mode_rows+=("Back" "__back__")
+
+      if [[ -n $prompt_prefix ]]; then
+        choice=$(zenity_pick_one "${prompt_prefix} ${refresh_prompt}${resolution}." "Vertical Refresh Rate" "Back" "${mode_rows[@]}") || break
+      else
+        choice=$(zenity_pick_one "${refresh_prompt}${resolution}." "Vertical Refresh Rate" "Back" "${mode_rows[@]}") || break
+      fi
+      [[ $choice == "__back__" ]] && break
+      mode=$choice
+
+      printf '%s\n' "$mode"
+      return 0
+    done
+  done
+}
+
+pick_single_monitor_mode() {
+  local connector=$1
+  local mode
+
+  if ! mode=$(pick_mode_for_connector "$connector" ""); then
+    return 1
+  fi
+
+  run_config gdctl set -P -L -p -M "$connector" -m "$mode"
+}
+
+pick_monitors_for_extend() {
+  local choice next_connector
+  local -a rows=()
+  local -a remaining=()
+  local connector label
+
+  SELECTED_MONITORS=()
+
+  while :; do
+    if [[ ${#SELECTED_MONITORS[@]} -eq 0 ]]; then
+      mapfile -t rows < <(build_monitor_rows)
+      rows+=("Back" "__back__")
+      choice=$(zenity_pick_one "Choose the leftmost monitor." "Monitor" "Back" "${rows[@]}") || return 1
+      [[ $choice == "__back__" ]] && return 1
+      SELECTED_MONITORS=("$choice")
+      continue
+    fi
+
+    remaining=()
+
+    for connector in "${MONITORS[@]}"; do
+      if [[ " ${SELECTED_MONITORS[*]} " == *" ${connector} "* ]]; then
+        continue
+      fi
+
+      label=${MONITOR_LABEL["$connector"]}
+      remaining+=("$label" "$connector")
+    done
+
+    if [[ ${#remaining[@]} -eq 0 ]]; then
+      [[ ${#SELECTED_MONITORS[@]} -ge 2 ]] && break
+      continue
+    fi
+
+    remaining+=("Done" "__done__")
+    remaining+=("Back" "__back__")
+    next_connector=$(zenity_pick_one "Choose the next monitor to the right." "Monitor" "Back" "${remaining[@]}") || return 1
+
+    if [[ $next_connector == "__back__" ]]; then
+      unset 'SELECTED_MONITORS[-1]'
+      SELECTED_MONITORS=("${SELECTED_MONITORS[@]}")
+      continue
+    fi
+
+    if [[ $next_connector == "__done__" ]]; then
+      if [[ ${#SELECTED_MONITORS[@]} -ge 2 ]]; then
+        break
+      fi
+
+      continue
+    fi
+
+    SELECTED_MONITORS+=("$next_connector")
+  done
+
+  return 0
+}
+
+pick_monitors_for_duplicate() {
+  local choice
+  local -a rows=()
+  local connector label
+
+  SELECTED_MONITORS=()
+
+  while :; do
+    rows=()
+
+    for connector in "${MONITORS[@]}"; do
+      if [[ " ${SELECTED_MONITORS[*]} " == *" ${connector} "* ]]; then
+        continue
+      fi
+
+      label=${MONITOR_LABEL["$connector"]}
+      rows+=("$label" "$connector")
+    done
+
+    rows+=("Done" "__done__")
+    rows+=("Back" "__back__")
+    choice=$(zenity_pick_one "Choose monitors to duplicate." "Monitor" "Back" "${rows[@]}") || return 1
+
+    if [[ $choice == "__back__" ]]; then
+      if [[ ${#SELECTED_MONITORS[@]} -eq 0 ]]; then
+        return 1
+      fi
+
+      unset 'SELECTED_MONITORS[-1]'
+      SELECTED_MONITORS=("${SELECTED_MONITORS[@]}")
+      continue
+    fi
+
+    if [[ $choice == "__done__" ]]; then
+      if [[ ${#SELECTED_MONITORS[@]} -ge 2 ]]; then
+        return 0
+      fi
+
+      continue
+    fi
+
+    SELECTED_MONITORS+=("$choice")
+  done
+}
+
+declare -A SELECTED_MODES=()
+declare SELECTED_PRIMARY_MONITOR=""
+
+pick_primary_monitor_for_extend() {
+  local choice
+  local -a rows=()
+  local connector label
+
+  for connector in "${SELECTED_MONITORS[@]}"; do
+    label=${MONITOR_LABEL["$connector"]}
+    rows+=("$label" "$connector")
+  done
+
+  rows+=("Back" "__back__")
+  choice=$(zenity_pick_one "Choose the primary monitor." "Monitor" "Back" "${rows[@]}") || return 1
+  [[ $choice == "__back__" ]] && return 1
+
+  SELECTED_PRIMARY_MONITOR=$choice
+  return 0
+}
+
+apply_extend() {
+  local cmd=(gdctl set -P)
+  local connector
+  local x_offset=0
+  local mode
+  local resolution
+  local width
+
+  for connector in "${SELECTED_MONITORS[@]}"; do
+    mode=${SELECTED_MODES["$connector"]-}
+    [[ -z $mode ]] && cancel
+    resolution=${mode%@*}
+
+    cmd+=(-L)
+
+    if [[ $connector == "$SELECTED_PRIMARY_MONITOR" ]]; then
+      cmd+=(-p)
+    fi
+
+    cmd+=(-x "$x_offset" -M "$connector" -m "$mode")
+
+    width=${resolution%x*}
+    x_offset=$((x_offset + width))
+  done
+
+  run_config "${cmd[@]}"
+}
+
+pick_modes_for_extend() {
+  local connector mode
+
+  SELECTED_MODES=()
+
+  for connector in "${SELECTED_MONITORS[@]}"; do
+    if ! mode=$(pick_mode_for_connector "$connector" "Extend setup:"); then
+      return 1
+    fi
+
+    SELECTED_MODES["$connector"]=$mode
+  done
+
+  return 0
+}
+
+pick_mode_for_duplicate() {
+  local connector resolution
+  local -a common_resolutions=() resolution_rows=() mode_rows=()
+  local choice
+
+  # Seed with first monitor's resolutions
+  IFS='|' read -r -a common_resolutions <<< "${RESOLUTIONS[${SELECTED_MONITORS[0]}]-}"
+
+  # Intersect with each remaining monitor
+  for connector in "${SELECTED_MONITORS[@]:1}"; do
+    local -a filtered=()
+    for resolution in "${common_resolutions[@]}"; do
+      [[ -z $resolution ]] && continue
+      [[ ${RESOLUTIONS[$connector]-} == *"|${resolution}|"* ]] && filtered+=("$resolution")
+    done
+    common_resolutions=("${filtered[@]}")
+  done
+
+  # Build resolution rows
+  for resolution in "${common_resolutions[@]}"; do
+    [[ -z $resolution ]] && continue
+    resolution_rows+=("$resolution" "$resolution")
+  done
+
+  if [[ ${#resolution_rows[@]} -eq 0 ]]; then
+    show_error "No common resolution found across selected monitors."
+    return 1
+  fi
+
+  resolution_rows+=("Back" "__back__")
+  choice=$(zenity_pick_one "Choose a resolution for all duplicated monitors." "Resolution" "Back" "${resolution_rows[@]}") || return 1
+  [[ $choice == "__back__" ]] && return 1
+  resolution=$choice
+
+  # Build mode rows from first monitor (all share this resolution)
+  mapfile -t mode_rows < <(build_mode_rows "${SELECTED_MONITORS[0]}" "$resolution")
+  [[ ${#mode_rows[@]} -eq 0 ]] && return 1
+  mode_rows+=("Back" "__back__")
+
+  choice=$(zenity_pick_one "Choose a refresh rate for all duplicated monitors at ${resolution}." "Vertical Refresh Rate" "Back" "${mode_rows[@]}") || return 1
+  [[ $choice == "__back__" ]] && return 1
+
+  printf '%s\n' "$choice"
+}
+
+apply_duplicate() {
+  local mode=$1
+  local cmd=(gdctl set -P -L -p)
+  local connector
+
+  for connector in "${SELECTED_MONITORS[@]}"; do
+    cmd+=(-M "$connector" -m "$mode")
+  done
+
+  run_config "${cmd[@]}"
+}
+
+main() {
+  local query main_choice
+  local -a main_rows=()
+  local connector
+
+  require_command zenity
+  require_command gdctl
+
+  if ! run_capture query gdctl show --verbose; then
+    exit 1
+  fi
+
+  if [[ -z $query ]]; then
+    show_error "Failed to query monitors: empty response."
+    exit 1
+  fi
+
+  parse_query "$query"
+  if [[ ${#MONITORS[@]} -eq 0 ]]; then
+    show_error "No monitors were detected in gdctl output."
+    exit 1
+  fi
+
+  for connector in "${MONITORS[@]}"; do
+    main_rows+=("${MONITOR_LABEL["$connector"]}" "monitor:${connector}")
+  done
+
+  main_rows+=("Extend monitors" "extend")
+  main_rows+=("Duplicate monitors" "duplicate")
+
+  while :; do
+    main_choice=$(zenity_pick_one "Choose what you want to do." "Option" "Cancel" "${main_rows[@]}") || cancel
+
+    case "$main_choice" in
+      monitor:*)
+        if ! pick_single_monitor_mode "${main_choice#monitor:}"; then
+          continue
+        fi
+        return 0
+        ;;
+      extend)
+        if ! pick_monitors_for_extend; then
+          continue
+        fi
+        if ! pick_modes_for_extend; then
+          continue
+        fi
+        if ! pick_primary_monitor_for_extend; then
+          continue
+        fi
+        apply_extend || return 1
+        return 0
+        ;;
+      duplicate)
+        if ! pick_monitors_for_duplicate; then
+          continue
+        fi
+        local dup_mode
+        if ! dup_mode=$(pick_mode_for_duplicate); then
+          continue
+        fi
+        apply_duplicate "$dup_mode" || return 1
+        return 0
+        ;;
+      *)
+        cancel
+        ;;
+    esac
+  done
+}
+
+main "$@"
